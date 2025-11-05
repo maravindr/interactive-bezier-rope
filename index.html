@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interactive Bézier Rope (Canvas + Physics)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0f14; color: #e6edf3; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #hud { position: fixed; left: 12px; top: 10px; background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.4; pointer-events: none; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    .kbd { padding: 1px 6px; border: 1px solid #8892a6; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(255,255,255,0.04); }
+    a { color: #7cc7ff; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><strong>Bézier Rope</strong> — move mouse / drag to pull the rope.</div>
+    <div>Physics: <span id="kval"></span> stiffness, <span id="dval"></span> damping</div>
+    <div>Controls: <span class="kbd">↑/↓</span> stiffness, <span class="kbd">←/→</span> damping, <span class="kbd">R</span> reset</div>
+    <div>FPS: <span id="fps">—</span></div>
+  </div>
+  <canvas id="c"></canvas>
+
+  <script>
+  (() => {
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const hudK = document.getElementById('kval');
+    const hudD = document.getElementById('dval');
+    const hudFPS = document.getElementById('fps');
+
+    function resize() {
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      canvas.width = Math.floor(window.innerWidth * dpr);
+      canvas.height = Math.floor(window.innerHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // ---- Vector helpers ----
+    const V = {
+      add: (a,b) => ({x:a.x+b.x, y:a.y+b.y}),
+      sub: (a,b) => ({x:a.x-b.x, y:a.y-b.y}),
+      mul: (a,s) => ({x:a.x*s, y:a.y*s}),
+      len: (a) => Math.hypot(a.x, a.y),
+      norm: (a) => {
+        const L = Math.hypot(a.x, a.y) || 1e-6;
+        return {x:a.x/L, y:a.y/L};
+      }
+    };
+
+    // ---- Bézier math ----
+    function cubicBezier(p0, p1, p2, p3, t) {
+      const u = 1 - t;
+      const tt = t*t;
+      const uu = u*u;
+      const uuu = uu*u;
+      const ttt = tt*t;
+      return {
+        x: uuu*p0.x + 3*uu*t*p1.x + 3*u*tt*p2.x + ttt*p3.x,
+        y: uuu*p0.y + 3*uu*t*p1.y + 3*u*tt*p2.y + ttt*p3.y
+      };
+    }
+    function cubicBezierDeriv(p0, p1, p2, p3, t) {
+      const u = 1 - t;
+      return {
+        x: 3*u*u*(p1.x-p0.x) + 6*u*t*(p2.x-p1.x) + 3*t*t*(p3.x-p2.x),
+        y: 3*u*u*(p1.y-p0.y) + 6*u*t*(p2.y-p1.y) + 3*t*t*(p3.y-p2.y)
+      };
+    }
+
+    // ---- World + physics ----
+    const world = {
+      k: 18.0,         // spring stiffness
+      d: 7.0,          // damping
+      p0: {x: 120, y: 0}, // will set y on layout()
+      p3: {x: 0, y: 0},   // will set on layout()
+      p1: {x: 0, y: 0},
+      p2: {x: 0, y: 0},
+      v1: {x: 0, y: 0},
+      v2: {x: 0, y: 0},
+      t1: {x: 0, y: 0},   // targets (follow mouse)
+      t2: {x: 0, y: 0},
+    };
+
+    function layout() {
+      const w = canvas.width / (window.devicePixelRatio || 1);
+      const h = canvas.height / (window.devicePixelRatio || 1);
+      world.p0 = { x: 0.1*w, y: 0.5*h };
+      world.p3 = { x: 0.9*w, y: 0.5*h };
+      // initial control points slightly bowed
+      world.p1 = { x: 0.3*w, y: 0.4*h };
+      world.p2 = { x: 0.7*w, y: 0.6*h };
+      world.t1 = {...world.p1};
+      world.t2 = {...world.p2};
+    }
+    layout();
+
+    // ---- Interaction (mouse/touch) ----
+    function updateTargets(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+
+      // Map: make P1 chase a point left of the cursor and P2 chase one right of the cursor.
+      const w = rect.width;
+      const offset = Math.max(40, w * 0.06);
+      world.t1 = { x: x - offset, y };
+      world.t2 = { x: x + offset, y };
+    }
+    window.addEventListener('mousemove', (e) => updateTargets(e.clientX, e.clientY), { passive: true });
+    window.addEventListener('touchmove', (e) => {
+      const t = e.touches[0];
+      if (t) updateTargets(t.clientX, t.clientY);
+    }, { passive: true });
+
+    // Keyboard tuning
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowUp') world.k = Math.min(60, world.k + 1);
+      if (e.key === 'ArrowDown') world.k = Math.max(1, world.k - 1);
+      if (e.key === 'ArrowRight') world.d = Math.min(30, world.d + 0.5);
+      if (e.key === 'ArrowLeft') world.d = Math.max(0, world.d - 0.5);
+      if (e.key.toLowerCase() === 'r') {
+        world.v1 = {x:0, y:0}; world.v2 = {x:0, y:0};
+        layout();
+      }
+    });
+
+    // ---- Animation loop ----
+    let last = performance.now();
+    let fpsAccum = 0, fpsCount = 0, fpsLast = performance.now();
+
+    function step(now) {
+      const dtRaw = (now - last) / 1000;
+      last = now;
+      const dt = Math.min(1/30, Math.max(1/1000, dtRaw)); // clamp dt for stability
+
+      // Physics: for p1 and p2 independently
+      function integrate(p, v, target) {
+        const toTarget = V.sub(p, target); // displacement
+        const accel = V.add( V.mul(toTarget, -world.k), V.mul(v, -world.d) );
+        // semi-implicit Euler
+        v.x += accel.x * dt;
+        v.y += accel.y * dt;
+        p.x += v.x * dt;
+        p.y += v.y * dt;
+      }
+      integrate(world.p1, world.v1, world.t1);
+      integrate(world.p2, world.v2, world.t2);
+
+      render();
+
+      // fps HUD (smoothed)
+      fpsAccum += 1;
+      if (now - fpsLast > 500) {
+        const fps = (fpsAccum * 1000) / (now - fpsLast);
+        hudFPS.textContent = fps.toFixed(0);
+        fpsAccum = 0;
+        fpsLast = now;
+      }
+
+      requestAnimationFrame(step);
+    }
+
+    function render() {
+      const w = canvas.width / (window.devicePixelRatio || 1);
+      const h = canvas.height / (window.devicePixelRatio || 1);
+
+      // Clear
+      ctx.fillStyle = '#0b0f14';
+      ctx.fillRect(0, 0, w, h);
+
+      // Grid background (subtle)
+      ctx.save();
+      ctx.globalAlpha = 0.2;
+      const grid = 32;
+      for (let x = 0; x <= w; x += grid) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h);
+        ctx.lineWidth = 1; ctx.strokeStyle = '#101821'; ctx.stroke();
+      }
+      for (let y = 0; y <= h; y += grid) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y);
+        ctx.lineWidth = 1; ctx.strokeStyle = '#101821'; ctx.stroke();
+      }
+      ctx.restore();
+
+      // Tangents along the curve at intervals
+      const tangentLen = Math.min(w, h) * 0.04;
+
+      // Draw curve as polyline
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#7cc7ff';
+      ctx.beginPath();
+      const samples = 100;
+      for (let i = 0; i <= samples; i++) {
+        const t = i / samples;
+        const pt = cubicBezier(world.p0, world.p1, world.p2, world.p3, t);
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      }
+      ctx.stroke();
+
+      // Draw tangents
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#9ef0a8';
+      for (let i = 0; i <= 10; i++) {
+        const t = i / 10;
+        const p = cubicBezier(world.p0, world.p1, world.p2, world.p3, t);
+        const d = cubicBezierDeriv(world.p0, world.p1, world.p2, world.p3, t);
+        const n = V.norm(d);
+        const a = { x: p.x - n.x * (tangentLen*0.5), y: p.y - n.y * (tangentLen*0.5) };
+        const b = { x: p.x + n.x * (tangentLen*0.5), y: p.y + n.y * (tangentLen*0.5) };
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+
+      // Draw control polygon
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#f0b46f';
+      ctx.beginPath();
+      ctx.moveTo(world.p0.x, world.p0.y);
+      ctx.lineTo(world.p1.x, world.p1.y);
+      ctx.lineTo(world.p2.x, world.p2.y);
+      ctx.lineTo(world.p3.x, world.p3.y);
+      ctx.stroke();
+
+      // Draw control points
+      function dot(p, r, color) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+      dot(world.p0, 5, '#ff7a7a');
+      dot(world.p3, 5, '#ff7a7a');
+      dot(world.p1, 5, '#ffd27a');
+      dot(world.p2, 5, '#ffd27a');
+
+      // HUD text
+      hudK.textContent = world.k.toFixed(1);
+      hudD.textContent = world.d.toFixed(1);
+    }
+
+    requestAnimationFrame(step);
+  })();
+  </script>
+</body>
+</html>
